@@ -1,0 +1,324 @@
+package com.movie_reservation.MovieReservationSystem.service;
+
+import com.movie_reservation.MovieReservationSystem.constant.ReservationStatus;
+import com.movie_reservation.MovieReservationSystem.constant.ShowtimeStatus;
+import com.movie_reservation.MovieReservationSystem.dto.request.BulkShowtimeRequest;
+import com.movie_reservation.MovieReservationSystem.dto.request.ShowtimeRequest;
+import com.movie_reservation.MovieReservationSystem.dto.response.SeatResponse;
+import com.movie_reservation.MovieReservationSystem.dto.response.ShowtimeResponse;
+import com.movie_reservation.MovieReservationSystem.entity.*;
+import com.movie_reservation.MovieReservationSystem.exception.BusinessException;
+import com.movie_reservation.MovieReservationSystem.exception.ResourceNotFoundException;
+import com.movie_reservation.MovieReservationSystem.repository.*;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
+
+import java.time.DayOfWeek;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class ShowtimeService {
+
+    @Value("${showtime.buffer-minutes:15}")
+    private int bufferMinutes;
+
+    private final ShowtimeRepository showtimeRepository;
+    private final MovieRepository movieRepository;
+    private final HallRepository hallRepository;
+    private final SeatRepository seatRepository;
+    private final ReservationSeatRepository reservationSeatRepository;
+    private final ReservationRepository reservationRepository;
+    private final SeatAllocationRepository seatAllocationRepository;
+    private final UserRepository userRepository;
+
+    public List<ShowtimeResponse> getShowtimesForMovie(Long movieId, String date) {
+        List<Showtime> showtimes = showtimeRepository.findByMovieIdAndStatusAndStartTimeAfter(
+                movieId, ShowtimeStatus.SCHEDULED, LocalDateTime.now());
+
+        if (StringUtils.hasText(date)) {
+            showtimes = showtimes.stream()
+                    .filter(s -> {
+                        String showDate = s.getStartTime().toLocalDate()
+                                .format(DateTimeFormatter.ISO_LOCAL_DATE);
+                        return showDate.equals(date);
+                    })
+                    .collect(Collectors.toList());
+        }
+
+        return showtimes.stream()
+                .map(this::toResponse)
+                .collect(Collectors.toList());
+    }
+
+    public List<ShowtimeResponse> listAll(Long movieId, Long hallId, String status,
+                                          LocalDateTime from, LocalDateTime to) {
+        return showtimeRepository.findAllByOrderByStartTimeAsc().stream()
+                .filter(s -> movieId == null || s.getMovie().getId().equals(movieId))
+                .filter(s -> hallId == null || s.getHall().getId().equals(hallId))
+                .filter(s -> status == null || status.isBlank() || status.equals(s.getStatus()))
+                .filter(s -> from == null || !s.getStartTime().isBefore(from))
+                .filter(s -> to == null || !s.getStartTime().isAfter(to))
+                .map(this::toResponse)
+                .collect(Collectors.toList());
+    }
+
+    public ShowtimeResponse getShowtimeById(Long id) {
+        Showtime showtime = showtimeRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Showtime", id));
+        return toResponse(showtime);
+    }
+
+    public List<SeatResponse> getAvailableSeats(Long showtimeId) {
+        Showtime showtime = showtimeRepository.findById(showtimeId)
+                .orElseThrow(() -> new ResourceNotFoundException("Showtime", showtimeId));
+
+        List<Seat> allSeats = seatRepository.findByHallId(showtime.getHall().getId());
+
+        Set<Long> bookedSeatIds = reservationSeatRepository.findByShowtimeId(showtimeId)
+                .stream()
+                .filter(rs -> rs.getReservation() != null && ReservationStatus.CONFIRMED.equals(rs.getReservation().getStatus()))
+                .map(rs -> rs.getSeat().getId())
+                .collect(Collectors.toSet());
+
+        Set<Long> heldSeatIds = seatAllocationRepository.findByShowtimeId(showtimeId)
+                .stream()
+                .filter(sa -> sa.getHoldExpiresAt().isAfter(LocalDateTime.now()))
+                .map(sa -> sa.getSeat().getId())
+                .collect(Collectors.toSet());
+
+        return allSeats.stream()
+                .map(seat -> {
+                    String status;
+                    if (bookedSeatIds.contains(seat.getId())) status = "BOOKED";
+                    else if (heldSeatIds.contains(seat.getId())) status = "HELD_BY_OTHER";
+                    else status = "AVAILABLE";
+                    return SeatResponse.builder()
+                            .id(seat.getId())
+                            .rowLabel(seat.getRowLabel())
+                            .seatNumber(seat.getSeatNumber())
+                            .seatType(seat.getSeatType())
+                            .status(status)
+                            .build();
+                })
+                .collect(Collectors.toList());
+    }
+
+    @Transactional
+    public List<SeatResponse> getSeatMap(Long showtimeId, String callerEmail) {
+        Showtime showtime = showtimeRepository.findById(showtimeId)
+                .orElseThrow(() -> new ResourceNotFoundException("Showtime", showtimeId));
+
+        seatAllocationRepository.deleteExpiredForSeats(
+                showtimeId,
+                seatRepository.findByHallId(showtime.getHall().getId())
+                        .stream().map(Seat::getId).collect(Collectors.toList()),
+                LocalDateTime.now());
+
+        List<Seat> allSeats = seatRepository.findByHallId(showtime.getHall().getId());
+
+        Set<Long> bookedSeatIds = reservationSeatRepository.findByShowtimeId(showtimeId)
+                .stream()
+                .filter(rs -> rs.getReservation() != null && ReservationStatus.CONFIRMED.equals(rs.getReservation().getStatus()))
+                .map(rs -> rs.getSeat().getId())
+                .collect(Collectors.toSet());
+
+        Map<Long, SeatAllocation> allocationBySeatId = seatAllocationRepository
+                .findByShowtimeId(showtimeId)
+                .stream()
+                .collect(Collectors.toMap(sa -> sa.getSeat().getId(), sa -> sa, (a, b) -> a));
+
+        Long callerId = null;
+        if (callerEmail != null) {
+            callerId = userRepository.findByEmail(callerEmail).map(User::getId).orElse(null);
+        }
+        final Long finalCallerId = callerId;
+
+        return allSeats.stream()
+                .map(seat -> {
+                    String status;
+                    if (bookedSeatIds.contains(seat.getId())) {
+                        status = "BOOKED";
+                    } else {
+                        SeatAllocation alloc = allocationBySeatId.get(seat.getId());
+                        if (alloc == null) {
+                            status = "AVAILABLE";
+                        } else if (finalCallerId != null && alloc.getHoldOwner().getId().equals(finalCallerId)) {
+                            status = "HELD_BY_ME";
+                        } else {
+                            status = "HELD_BY_OTHER";
+                        }
+                    }
+                    return SeatResponse.builder()
+                            .id(seat.getId())
+                            .rowLabel(seat.getRowLabel())
+                            .seatNumber(seat.getSeatNumber())
+                            .seatType(seat.getSeatType())
+                            .status(status)
+                            .build();
+                })
+                .collect(Collectors.toList());
+    }
+
+    public ShowtimeResponse createShowtime(ShowtimeRequest request) {
+        Movie movie = movieRepository.findByIdAndIsDeletedFalse(request.getMovieId())
+                .orElseThrow(() -> new ResourceNotFoundException("Movie", request.getMovieId()));
+
+        Hall hall = hallRepository.findById(request.getHallId())
+                .orElseThrow(() -> new ResourceNotFoundException("Hall", request.getHallId()));
+
+        LocalDateTime endTime = request.getStartTime()
+                .plusMinutes(movie.getDurationMinutes())
+                .plusMinutes(bufferMinutes);
+
+        boolean hasOverlap = showtimeRepository
+                .existsByHallIdAndStatusAndStartTimeLessThanAndEndTimeGreaterThan(
+                        hall.getId(), ShowtimeStatus.SCHEDULED, endTime, request.getStartTime());
+
+        if (hasOverlap) {
+            throw new BusinessException("SCHEDULE_CONFLICT",
+                    "The hall is already booked during this time slot");
+        }
+
+        Showtime showtime = Showtime.builder()
+                .movie(movie)
+                .hall(hall)
+                .startTime(request.getStartTime())
+                .endTime(endTime)
+                .price(request.getPrice())
+                .status(ShowtimeStatus.SCHEDULED)
+                .build();
+
+        showtime = showtimeRepository.save(showtime);
+        log.info("Created showtime id={} movieId={} hallId={}", showtime.getId(), movie.getId(), hall.getId());
+        return toResponse(showtime);
+    }
+
+    public ShowtimeResponse updateShowtime(Long id, ShowtimeRequest request) {
+        Showtime showtime = showtimeRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Showtime", id));
+
+        Movie movie = movieRepository.findByIdAndIsDeletedFalse(request.getMovieId())
+                .orElseThrow(() -> new ResourceNotFoundException("Movie", request.getMovieId()));
+
+        Hall hall = hallRepository.findById(request.getHallId())
+                .orElseThrow(() -> new ResourceNotFoundException("Hall", request.getHallId()));
+
+        LocalDateTime endTime = request.getStartTime()
+                .plusMinutes(movie.getDurationMinutes())
+                .plusMinutes(bufferMinutes);
+
+        boolean hasOverlap = showtimeRepository
+                .existsByHallIdAndStatusAndStartTimeLessThanAndEndTimeGreaterThan(
+                        hall.getId(), ShowtimeStatus.SCHEDULED, endTime, request.getStartTime());
+
+        if (hasOverlap && !showtime.getHall().getId().equals(hall.getId())) {
+            throw new BusinessException("SCHEDULE_CONFLICT",
+                    "The hall is already booked during this time slot");
+        }
+
+        showtime.setMovie(movie);
+        showtime.setHall(hall);
+        showtime.setStartTime(request.getStartTime());
+        showtime.setEndTime(endTime);
+        showtime.setPrice(request.getPrice());
+
+        showtime = showtimeRepository.save(showtime);
+        log.info("Updated showtime id={}", id);
+        return toResponse(showtime);
+    }
+
+    @Transactional
+    public void cancelShowtime(Long id) {
+        Showtime showtime = showtimeRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Showtime", id));
+
+        if (ShowtimeStatus.CANCELLED.equals(showtime.getStatus())) {
+            throw new BusinessException("ALREADY_CANCELLED", "Showtime is already cancelled");
+        }
+
+        showtime.setStatus(ShowtimeStatus.CANCELLED);
+        showtimeRepository.save(showtime);
+
+        reservationRepository.findConfirmedByShowtimeId(id)
+                .forEach(reservation -> {
+                    reservation.setStatus(ReservationStatus.CANCELLED);
+                    reservationRepository.save(reservation);
+                });
+
+        log.info("Cancelled showtime id={}", id);
+    }
+
+    @Transactional
+    public List<ShowtimeResponse> createBulkShowtimes(BulkShowtimeRequest request) {
+        Movie movie = movieRepository.findByIdAndIsDeletedFalse(request.getMovieId())
+                .orElseThrow(() -> new ResourceNotFoundException("Movie", request.getMovieId()));
+
+        Hall hall = hallRepository.findById(request.getHallId())
+                .orElseThrow(() -> new ResourceNotFoundException("Hall", request.getHallId()));
+
+        Set<DayOfWeek> targetDays = request.getDaysOfWeek().stream()
+                .map(d -> DayOfWeek.valueOf(d.toUpperCase()))
+                .collect(Collectors.toSet());
+
+        List<ShowtimeResponse> created = new ArrayList<>();
+        LocalDate current = request.getStartDate();
+
+        while (!current.isAfter(request.getEndDate())) {
+            if (targetDays.contains(current.getDayOfWeek())) {
+                for (LocalTime time : request.getTimes()) {
+                    LocalDateTime startTime = current.atTime(time);
+                    LocalDateTime endTime = startTime
+                            .plusMinutes(movie.getDurationMinutes())
+                            .plusMinutes(bufferMinutes);
+
+                    boolean hasOverlap = showtimeRepository
+                            .existsByHallIdAndStatusAndStartTimeLessThanAndEndTimeGreaterThan(
+                                    hall.getId(), ShowtimeStatus.SCHEDULED, endTime, startTime);
+
+                    if (!hasOverlap) {
+                        Showtime showtime = Showtime.builder()
+                                .movie(movie)
+                                .hall(hall)
+                                .startTime(startTime)
+                                .endTime(endTime)
+                                .price(request.getPrice())
+                                .status(ShowtimeStatus.SCHEDULED)
+                                .build();
+                        showtime = showtimeRepository.save(showtime);
+                        created.add(toResponse(showtime));
+                    }
+                }
+            }
+            current = current.plusDays(1);
+        }
+
+        log.info("Bulk created {} showtimes for movie={} hall={}", created.size(), movie.getId(), hall.getId());
+        return created;
+    }
+
+    public ShowtimeResponse toResponse(Showtime showtime) {
+        return ShowtimeResponse.builder()
+                .id(showtime.getId())
+                .movieId(showtime.getMovie().getId())
+                .hallId(showtime.getHall().getId())
+                .hallName(showtime.getHall().getName())
+                .startTime(showtime.getStartTime())
+                .endTime(showtime.getEndTime())
+                .price(showtime.getPrice())
+                .status(showtime.getStatus())
+                .date(ShowtimeResponse.computeDate(showtime.getStartTime()))
+                .time(ShowtimeResponse.computeTime(showtime.getStartTime()))
+                .build();
+    }
+}
