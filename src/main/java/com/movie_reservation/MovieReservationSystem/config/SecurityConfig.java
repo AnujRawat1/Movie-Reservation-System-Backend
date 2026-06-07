@@ -47,6 +47,7 @@ public class SecurityConfig {
                 "http://localhost:*",
                 "http://127.0.0.1:*",
                 "https://movie-reservation-system-frontend.vercel.app",
+                "https://movie-reservation-system-frontend-2s1mp3op7.vercel.app",
                 "https://movie-reservation-system-backend-h634.onrender.com"
         ));
         configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
