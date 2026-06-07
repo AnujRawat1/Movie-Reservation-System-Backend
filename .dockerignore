@@ -1,0 +1,15 @@
+target/
+.mvn/
+.git/
+.gitignore
+.idea/
+*.iml
+*.iws
+*.ipr
+.DS_Store
+.vscode/
+.env
+README.md
+HELP.md
+mvnw
+mvnw.cmd

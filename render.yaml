@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: movie-reservation-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    region: oregon
+    envVars:
+      - key: SERVER_PORT
+        value: 8080
